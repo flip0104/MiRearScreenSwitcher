@@ -10,10 +10,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.hardware.display.DisplayManager;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Display;
 
 import rikka.shizuku.Shizuku;
 
@@ -26,12 +29,46 @@ public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
     private static final int NOTIFICATION_ID = 1001; // 与其他Service共用ID
     private static final int WAKEUP_INTERVAL_MS = 100; // 100ms间隔
-    
+    private static final long CHECK_REAR_INTERVAL_MS = 2000; // 每2秒检查背屏内容
+    private static final int REAR_DISPLAY_ID = 1;
+    // 小米背屏官方组件（小部件/时钟等），显示时不唤醒
+    private static final String[] XIAOMI_WIDGET_PACKAGES = {
+        "com.xiaomi.subscreencenter",
+        "com.xiaomi.mirror",
+    };
+
     private ITaskService taskService;
     private Handler wakeupHandler;
     private Runnable wakeupRunnable;
-    private boolean isRunning = false;
+    private volatile boolean isRunning = false;
     private SharedPreferences prefs;
+    private DisplayManager displayManager;
+
+    // 背屏内容检查在后台线程执行（shell命令较慢，不阻塞100ms唤醒循环）
+    private HandlerThread checkThread;
+    private Handler checkHandler;
+    private volatile boolean xiaomiWidgetOnRear = false;
+
+    private final Runnable checkRearRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning) return;
+            try {
+                if (taskService != null) {
+                    String rearApp = taskService.getForegroundAppOnDisplay(REAR_DISPLAY_ID);
+                    boolean widget = isXiaomiWidget(rearApp);
+                    if (widget != xiaomiWidgetOnRear) {
+                        Log.d(TAG, widget ? "⏸ 背屏为小米组件，暂停唤醒: " + rearApp
+                                          : "▶ 背屏非小米组件，恢复唤醒: " + rearApp);
+                    }
+                    xiaomiWidgetOnRear = widget;
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "背屏内容检查失败: " + t.getMessage());
+            }
+            checkHandler.postDelayed(this, CHECK_REAR_INTERVAL_MS);
+        }
+    };
     
     private final Shizuku.UserServiceArgs serviceArgs = 
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -70,7 +107,11 @@ public class AlwaysWakeUpService extends Service {
         
         prefs = getSharedPreferences("mrss_settings", MODE_PRIVATE);
         wakeupHandler = new Handler(Looper.getMainLooper());
-        
+        displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+        checkThread = new HandlerThread("AlwaysWakeUpCheck");
+        checkThread.start();
+        checkHandler = new Handler(checkThread.getLooper());
+
         // 创建前台通知
         createForegroundNotification();
         
@@ -160,9 +201,10 @@ public class AlwaysWakeUpService extends Service {
                     return;
                 }
                 
+                // 背屏显示小米组件或处于休眠状态时，不唤醒
                 // 发送wakeup命令
                 try {
-                    if (taskService != null) {
+                    if (taskService != null && !xiaomiWidgetOnRear && !isRearScreenAsleep()) {
                         taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
                     }
                 } catch (Throwable t) {
@@ -174,15 +216,41 @@ public class AlwaysWakeUpService extends Service {
             }
         };
         
-        // 立即开始
+        // 先检查一次背屏内容，再开始唤醒循环
+        checkHandler.post(checkRearRunnable);
         wakeupHandler.post(wakeupRunnable);
         Log.d(TAG, "✓ Wakeup loop started (100ms interval)");
     }
-    
+
+    private static boolean isXiaomiWidget(String rearApp) {
+        if (rearApp == null) return false;
+        for (String pkg : XIAOMI_WIDGET_PACKAGES) {
+            if (rearApp.startsWith(pkg)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 背屏是否处于休眠（熄屏/AOD）状态。
+     * 唤醒循环本身会阻止背屏超时熄屏，因此背屏熄灭说明是用户主动休眠（如电源键），此时不应再唤醒。
+     */
+    private boolean isRearScreenAsleep() {
+        if (displayManager == null) return false;
+        Display rear = displayManager.getDisplay(REAR_DISPLAY_ID);
+        if (rear == null) return false;
+        int state = rear.getState();
+        return state == Display.STATE_OFF
+            || state == Display.STATE_DOZE
+            || state == Display.STATE_DOZE_SUSPEND;
+    }
+
     private void stopWakeupLoop() {
         isRunning = false;
         if (wakeupHandler != null && wakeupRunnable != null) {
             wakeupHandler.removeCallbacks(wakeupRunnable);
+        }
+        if (checkHandler != null) {
+            checkHandler.removeCallbacks(checkRearRunnable);
         }
         Log.d(TAG, "✓ Wakeup loop stopped");
     }
@@ -198,7 +266,10 @@ public class AlwaysWakeUpService extends Service {
         Log.d(TAG, "🔴 onDestroy");
         
         stopWakeupLoop();
-        
+        if (checkThread != null) {
+            checkThread.quitSafely();
+        }
+
         // 解绑TaskService
         try {
             if (taskService != null) {
