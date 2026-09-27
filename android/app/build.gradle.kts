@@ -24,10 +24,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_11.toString()
-    }
-
     defaultConfig {
         applicationId = "com.tgwgroup.MiRearScreenSwitcher"
         minSdk = 24  // Shizuku需要最低24
@@ -75,6 +71,12 @@ android {
 
     // V20: NDK and CMake configuration
     
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+    }
 }
 
 flutter {
