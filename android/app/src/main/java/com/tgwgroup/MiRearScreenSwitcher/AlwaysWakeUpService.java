@@ -29,7 +29,7 @@ public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
     private static final int NOTIFICATION_ID = 1001; // 与其他Service共用ID
     private static final int WAKEUP_INTERVAL_MS = 100; // 100ms间隔
-    private static final long CHECK_REAR_INTERVAL_MS = 2000; // 每2秒检查背屏内容
+    private static final long CHECK_REAR_INTERVAL_MS = 500; // 每0.5秒检查背屏内容（2秒太慢，切换小部件/壁纸时状态滞后）
     private static final int REAR_DISPLAY_ID = 1;
     // 小米背屏官方组件：Launcher（壁纸）照常唤醒，其他Activity（小部件等）不唤醒
     private static final String[] XIAOMI_WIDGET_PACKAGES = {
