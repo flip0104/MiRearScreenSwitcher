@@ -31,7 +31,7 @@ public class AlwaysWakeUpService extends Service {
     private static final int WAKEUP_INTERVAL_MS = 100; // 100ms间隔
     private static final long CHECK_REAR_INTERVAL_MS = 2000; // 每2秒检查背屏内容
     private static final int REAR_DISPLAY_ID = 1;
-    // 小米背屏官方组件（小部件/时钟等），显示时不唤醒
+    // 小米背屏官方组件：Launcher（壁纸）照常唤醒，其他Activity（小部件等）不唤醒
     private static final String[] XIAOMI_WIDGET_PACKAGES = {
         "com.xiaomi.subscreencenter",
         "com.xiaomi.mirror",
@@ -55,7 +55,7 @@ public class AlwaysWakeUpService extends Service {
             if (!isRunning) return;
             try {
                 if (taskService != null) {
-                    String rearApp = taskService.getForegroundAppOnDisplay(REAR_DISPLAY_ID);
+                    String rearApp = getRearTopComponent();
                     boolean widget = isXiaomiWidget(rearApp);
                     if (widget != xiaomiWidgetOnRear) {
                         Log.d(TAG, widget ? "⏸ 背屏为小米组件，暂停唤醒: " + rearApp
@@ -222,10 +222,37 @@ public class AlwaysWakeUpService extends Service {
         Log.d(TAG, "✓ Wakeup loop started (100ms interval)");
     }
 
-    private static boolean isXiaomiWidget(String rearApp) {
-        if (rearApp == null) return false;
+    /**
+     * 获取背屏最上层Task的组件名（"包名/Activity"），解析自 am stack list。
+     * getForegroundAppOnDisplay 只返回包名，无法区分小米Launcher（壁纸）和小部件。
+     */
+    private String getRearTopComponent() throws Exception {
+        String output = taskService.executeShellCommandWithResult("am stack list");
+        if (output == null) return null;
+        boolean inRearDisplay = false;
+        for (String line : output.split("\n")) {
+            if (line.startsWith("RootTask")) {
+                inRearDisplay = line.contains("displayId=" + REAR_DISPLAY_ID);
+                continue;
+            }
+            if (inRearDisplay && line.contains("taskId=") && line.contains("/")) {
+                int start = line.indexOf(": ", line.indexOf("taskId="));
+                if (start < 0) continue;
+                start += 2;
+                int end = line.indexOf(' ', start);
+                return (end < 0 ? line.substring(start) : line.substring(start, end)).trim();
+            }
+        }
+        return null;
+    }
+
+    private static boolean isXiaomiWidget(String rearComponent) {
+        if (rearComponent == null) return false;
         for (String pkg : XIAOMI_WIDGET_PACKAGES) {
-            if (rearApp.startsWith(pkg)) return true;
+            if (rearComponent.startsWith(pkg + "/")) {
+                // Launcher显示的是壁纸，需要保持唤醒
+                return !rearComponent.toLowerCase().contains("launcher");
+            }
         }
         return false;
     }
