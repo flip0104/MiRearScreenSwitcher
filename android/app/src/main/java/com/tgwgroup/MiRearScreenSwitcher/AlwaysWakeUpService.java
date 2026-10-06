@@ -10,28 +10,36 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.Display;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.WindowManager;
 
 import rikka.shizuku.Shizuku;
 
 /**
  * V3.5: 未投放应用时常亮服务
- * 以500ms间隔持续发送KEYCODE_WAKEUP唤醒背屏
- * 背屏被用户休眠（如双击背屏熄屏）时停止唤醒，背屏重新亮起后恢复
+ * 以100ms间隔持续发送KEYCODE_WAKEUP唤醒背屏
+ * 触摸背屏后暂停唤醒，让双击熄屏得以完成；背屏休眠期间不唤醒，重新亮起后恢复
  * ⚠️ 警告：可能导致烧屏和额外耗电
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
     private static final int NOTIFICATION_ID = 1001; // 与其他Service共用ID
-    // 500ms足以阻止背屏超时熄屏（与RearScreenKeeperService一致），间隔越短越容易打断双击熄屏
-    private static final int WAKEUP_INTERVAL_MS = 500;
-    // 背屏重新亮起后需持续亮屏这么久才恢复唤醒，避免熄屏/亮屏过渡期间误唤醒
-    private static final long RESUME_DELAY_MS = 1500;
+    private static final int WAKEUP_INTERVAL_MS = 100; // 100ms间隔
+    // 触摸背屏后暂停唤醒的时长：双击熄屏时，熄屏动画期间的wakeup会把背屏重新点亮。
+    // 用户触摸本身就会保持亮屏，所以暂停期间无需唤醒
+    private static final long TOUCH_PAUSE_MS = 2000;
     private static final int REAR_DISPLAY_ID = 1;
 
     private ITaskService taskService;
@@ -40,8 +48,10 @@ public class AlwaysWakeUpService extends Service {
     private volatile boolean isRunning = false;
     private SharedPreferences prefs;
     private DisplayManager displayManager;
-    // 背屏本次亮屏的起始时间，0表示背屏处于休眠
-    private long rearOnSinceMs = 0;
+    // 背屏上的1x1透明悬浮窗，通过FLAG_WATCH_OUTSIDE_TOUCH感知背屏任意位置的触摸
+    private WindowManager rearWindowManager;
+    private View rearTouchWatcher;
+    private volatile long lastRearTouchMs = 0;
     
     private final Shizuku.UserServiceArgs serviceArgs = 
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -171,7 +181,7 @@ public class AlwaysWakeUpService extends Service {
                     return;
                 }
                 
-                // 背屏被用户休眠（双击熄屏等）时不唤醒；重新亮起并稳定后再恢复
+                // 刚触摸过背屏，或背屏已被用户休眠（双击熄屏/电源键）时不唤醒
                 try {
                     if (taskService != null && shouldWakeRearScreen()) {
                         taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
@@ -185,27 +195,75 @@ public class AlwaysWakeUpService extends Service {
             }
         };
         
-        rearOnSinceMs = 0;
+        wakeupHandler.post(this::attachRearTouchWatcher); // addView需在主线程
         wakeupHandler.post(wakeupRunnable);
         Log.d(TAG, "✓ Wakeup loop started (" + WAKEUP_INTERVAL_MS + "ms interval)");
     }
 
-    /**
-     * 背屏亮着且已稳定亮屏RESUME_DELAY_MS以上时才唤醒。
-     * 唤醒循环本身会阻止背屏超时熄屏，因此背屏熄灭说明是用户主动休眠（双击背屏/电源键），此时不应再唤醒。
-     */
     private boolean shouldWakeRearScreen() {
-        if (isRearScreenAsleep()) {
-            if (rearOnSinceMs != 0) Log.d(TAG, "⏸ 背屏已休眠，暂停唤醒");
-            rearOnSinceMs = 0;
-            return false;
+        if (SystemClock.elapsedRealtime() - lastRearTouchMs < TOUCH_PAUSE_MS) return false;
+        // 唤醒循环本身会阻止背屏超时熄屏，因此背屏熄灭说明是用户主动休眠
+        return !isRearScreenAsleep();
+    }
+
+    /**
+     * 在背屏添加1x1透明悬浮窗，用ACTION_OUTSIDE事件记录背屏触摸时间（不拦截触摸）。
+     * 需要悬浮窗权限；失败时仅失去"触摸后暂停"功能。
+     */
+    private void attachRearTouchWatcher() {
+        if (rearTouchWatcher != null || displayManager == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                Log.w(TAG, "无悬浮窗权限，无法感知背屏触摸");
+                return;
+            }
+            Display rear = displayManager.getDisplay(REAR_DISPLAY_ID);
+            if (rear == null) return;
+
+            int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+            Context displayContext = createDisplayContext(rear);
+            Context windowContext = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                ? displayContext.createWindowContext(type, null)
+                : displayContext;
+            rearWindowManager = (WindowManager) windowContext.getSystemService(Context.WINDOW_SERVICE);
+
+            View watcher = new View(windowContext);
+            watcher.setOnTouchListener((v, event) -> {
+                if (event.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
+                    lastRearTouchMs = SystemClock.elapsedRealtime();
+                }
+                return false;
+            });
+
+            WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                1, 1, type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSPARENT);
+            params.gravity = Gravity.TOP | Gravity.START;
+
+            rearWindowManager.addView(watcher, params);
+            rearTouchWatcher = watcher;
+            Log.d(TAG, "✓ 背屏触摸监听已添加");
+        } catch (Throwable t) {
+            Log.w(TAG, "添加背屏触摸监听失败: " + t.getMessage());
+            rearWindowManager = null;
         }
-        long now = android.os.SystemClock.elapsedRealtime();
-        if (rearOnSinceMs == 0) {
-            rearOnSinceMs = now;
-            Log.d(TAG, "▶ 背屏已亮起，" + RESUME_DELAY_MS + "ms后恢复唤醒");
+    }
+
+    private void detachRearTouchWatcher() {
+        if (rearTouchWatcher == null || rearWindowManager == null) return;
+        try {
+            rearWindowManager.removeView(rearTouchWatcher);
+        } catch (Throwable t) {
+            Log.w(TAG, "移除背屏触摸监听失败: " + t.getMessage());
         }
-        return now - rearOnSinceMs >= RESUME_DELAY_MS;
+        rearTouchWatcher = null;
+        rearWindowManager = null;
     }
 
     /**
@@ -240,6 +298,7 @@ public class AlwaysWakeUpService extends Service {
         Log.d(TAG, "🔴 onDestroy");
         
         stopWakeupLoop();
+        detachRearTouchWatcher();
 
         // 解绑TaskService
         try {
