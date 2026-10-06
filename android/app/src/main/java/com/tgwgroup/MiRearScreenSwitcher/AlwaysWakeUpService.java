@@ -30,28 +30,31 @@ import rikka.shizuku.Shizuku;
 /**
  * V3.5: 未投放应用时常亮服务
  * 以100ms间隔持续发送KEYCODE_WAKEUP唤醒背屏
- * 触摸背屏后暂停唤醒，让双击熄屏得以完成；背屏休眠期间不唤醒，重新亮起后恢复
+ * 检测到双击背屏（小米双击熄屏手势）后暂停唤醒，背屏熄灭再亮起后恢复
  * ⚠️ 警告：可能导致烧屏和额外耗电
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
     private static final int NOTIFICATION_ID = 1001; // 与其他Service共用ID
     private static final int WAKEUP_INTERVAL_MS = 100; // 100ms间隔
-    // 触摸背屏后暂停唤醒的时长：双击熄屏时，熄屏动画期间的wakeup会把背屏重新点亮。
-    // 用户触摸本身就会保持亮屏，所以暂停期间无需唤醒
-    private static final long TOUCH_PAUSE_MS = 2000;
+    // 两次触摸间隔小于此值视为双击
+    private static final long DOUBLE_TAP_TIMEOUT_MS = 400;
     private static final int REAR_DISPLAY_ID = 1;
 
     private ITaskService taskService;
     private Handler wakeupHandler;
     private Runnable wakeupRunnable;
+    private int loopCount = 0;
     private volatile boolean isRunning = false;
     private SharedPreferences prefs;
     private DisplayManager displayManager;
     // 背屏上的1x1透明悬浮窗，通过FLAG_WATCH_OUTSIDE_TOUCH感知背屏任意位置的触摸
     private WindowManager rearWindowManager;
     private View rearTouchWatcher;
-    private volatile long lastRearTouchMs = 0;
+    private long lastRearTouchMs = 0;
+    // 用户双击熄屏后暂停唤醒；背屏熄灭后再次亮起（用户双击亮屏）时恢复
+    private volatile boolean pausedByDoubleTap = false;
+    private boolean rearOffWhilePaused = false;
     
     private final Shizuku.UserServiceArgs serviceArgs = 
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -172,6 +175,11 @@ public class AlwaysWakeUpService extends Service {
             @Override
             public void run() {
                 if (!isRunning) return;
+
+                // 悬浮窗权限可能在服务启动后才授予，每2秒重试添加触摸监听
+                if (rearTouchWatcher == null && ++loopCount % 20 == 0) {
+                    attachRearTouchWatcher();
+                }
                 
                 // 检查开关状态
                 boolean enabled = prefs.getBoolean("always_wakeup_enabled", false);
@@ -201,21 +209,46 @@ public class AlwaysWakeUpService extends Service {
     }
 
     private boolean shouldWakeRearScreen() {
-        if (SystemClock.elapsedRealtime() - lastRearTouchMs < TOUCH_PAUSE_MS) return false;
-        // 唤醒循环本身会阻止背屏超时熄屏，因此背屏熄灭说明是用户主动休眠
-        return !isRearScreenAsleep();
+        int state = getRearScreenState();
+        boolean rearOff = state == Display.STATE_OFF;
+        if (pausedByDoubleTap) {
+            // 双击熄屏后背屏可能进入OFF或DOZE，任一非亮屏状态都算已熄灭
+            if (state != Display.STATE_ON) {
+                rearOffWhilePaused = true;
+            } else if (rearOffWhilePaused) {
+                // 背屏熄灭后又亮起：用户已重新唤醒背屏，恢复常亮
+                pausedByDoubleTap = false;
+                rearOffWhilePaused = false;
+                Log.d(TAG, "▶ 背屏重新亮起，恢复唤醒");
+            }
+        }
+        // 背屏被电源键关闭时也不唤醒
+        return !pausedByDoubleTap && !rearOff;
+    }
+
+    private void onRearTouchDown() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastRearTouchMs < DOUBLE_TAP_TIMEOUT_MS) {
+            if (!pausedByDoubleTap) {
+                pausedByDoubleTap = true;
+                rearOffWhilePaused = false;
+                Log.d(TAG, "⏸ 检测到双击背屏，暂停唤醒");
+            }
+            lastRearTouchMs = 0; // 避免三连击被算作两次双击
+        } else {
+            lastRearTouchMs = now;
+        }
     }
 
     /**
      * 在背屏添加1x1透明悬浮窗，用ACTION_OUTSIDE事件记录背屏触摸时间（不拦截触摸）。
-     * 需要悬浮窗权限；失败时仅失去"触摸后暂停"功能。
+     * 需要悬浮窗权限；失败时仅失去"双击熄屏"功能。
      */
     private void attachRearTouchWatcher() {
         if (rearTouchWatcher != null || displayManager == null) return;
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-                Log.w(TAG, "无悬浮窗权限，无法感知背屏触摸");
-                return;
+                return; // 无悬浮窗权限，无法感知背屏触摸
             }
             Display rear = displayManager.getDisplay(REAR_DISPLAY_ID);
             if (rear == null) return;
@@ -232,7 +265,7 @@ public class AlwaysWakeUpService extends Service {
             View watcher = new View(windowContext);
             watcher.setOnTouchListener((v, event) -> {
                 if (event.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
-                    lastRearTouchMs = SystemClock.elapsedRealtime();
+                    onRearTouchDown();
                 }
                 return false;
             });
@@ -267,16 +300,13 @@ public class AlwaysWakeUpService extends Service {
     }
 
     /**
-     * 背屏是否处于休眠（熄屏/AOD）状态。
+     * 背屏显示状态。未暂停时只把STATE_OFF当作熄灭：背屏变暗时可能处于DOZE，此时仍需唤醒。
      */
-    private boolean isRearScreenAsleep() {
-        if (displayManager == null) return false;
+    private int getRearScreenState() {
+        if (displayManager == null) return Display.STATE_UNKNOWN;
         Display rear = displayManager.getDisplay(REAR_DISPLAY_ID);
-        if (rear == null) return false;
-        int state = rear.getState();
-        return state == Display.STATE_OFF
-            || state == Display.STATE_DOZE
-            || state == Display.STATE_DOZE_SUSPEND;
+        if (rear == null) return Display.STATE_UNKNOWN;
+        return rear.getState();
     }
 
     private void stopWakeupLoop() {
