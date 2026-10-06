@@ -619,21 +619,8 @@ public class MainActivity extends FlutterActivity {
                         SharedPreferences prefs = getSharedPreferences("mrss_settings", MODE_PRIVATE);
                         prefs.edit().putBoolean("always_wakeup_enabled", enabled).apply();
                         
-                        Intent intent = new Intent(this, AlwaysWakeUpService.class);
-                        if (enabled) {
-                            startService(intent);
-                            Log.d(TAG, "AlwaysWakeUpService started");
-                            // 双击背屏熄屏需要悬浮窗权限来感知背屏触摸
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-                                    && !android.provider.Settings.canDrawOverlays(this)) {
-                                Intent permIntent = new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
-                                permIntent.setData(android.net.Uri.parse("package:" + getPackageName()));
-                                startActivity(permIntent);
-                            }
-                        } else {
-                            stopService(intent);
-                            Log.d(TAG, "AlwaysWakeUpService stopped");
-                        }
+                        // 服务根据开关状态设置/恢复背屏熄屏时间后自行退出
+                        startService(new Intent(this, AlwaysWakeUpService.class));
                         
                         result.success(true);
                         break;
