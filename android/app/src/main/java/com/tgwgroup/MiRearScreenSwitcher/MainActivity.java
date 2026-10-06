@@ -623,6 +623,13 @@ public class MainActivity extends FlutterActivity {
                         if (enabled) {
                             startService(intent);
                             Log.d(TAG, "AlwaysWakeUpService started");
+                            // 双击背屏熄屏需要悬浮窗权限来感知背屏触摸
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                                    && !android.provider.Settings.canDrawOverlays(this)) {
+                                Intent permIntent = new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
+                                permIntent.setData(android.net.Uri.parse("package:" + getPackageName()));
+                                startActivity(permIntent);
+                            }
                         } else {
                             stopService(intent);
                             Log.d(TAG, "AlwaysWakeUpService stopped");
