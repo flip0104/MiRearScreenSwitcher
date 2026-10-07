@@ -44,7 +44,7 @@ public class AlwaysWakeUpService extends Service {
     private static final String PREF_SAVED_TIMEOUT = "always_wakeup_saved_subscreen_timeout";
     private static final String MIUI_POWER_SAVE_CHANGED = "miui.intent.action.POWER_SAVE_MODE_CHANGED";
     private static final int REAR_DISPLAY_ID = 1;
-    private static final String POWER_GROUP_LOGCAT_ARGS = "-b main -s PowerGroup:I";
+    private static final String POWER_GROUP_LOGCAT_ARGS = "-b system -s PowerGroup:I"; // system_server的日志在system缓冲区
     // 背屏(display group 1)被电源键熄灭的日志
     private static final String REAR_POWER_KEY_OFF_REGEX = "due to power_button \\(groupId= ?1,";
 

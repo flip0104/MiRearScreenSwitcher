@@ -135,7 +135,7 @@ interface ITaskService {
 
     /**
      * 阻塞等待：从调用时刻起，返回第一条匹配regex的logcat日志行
-     * @param logcatArgs logcat参数（如 "-b main -s PowerGroup:I"）
+     * @param logcatArgs logcat参数（如 "-b system -s PowerGroup:I"）
      * @param regex 要匹配的正则
      * @return 匹配的日志行，失败返回null
      */
