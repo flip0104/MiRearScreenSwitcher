@@ -947,5 +947,34 @@ public class TaskService extends ITaskService.Stub {
             return "";
         }
     }
-    
+
+    @Override
+    public String waitForLogLine(String logcatArgs, String regex) throws RemoteException {
+        Process process = null;
+        try {
+            // 只读取调用之后产生的日志（-T 起始时间，epoch秒格式）
+            long now = System.currentTimeMillis();
+            String since = (now / 1000) + "." + String.format(java.util.Locale.US, "%03d", now % 1000);
+            ProcessBuilder pb = new ProcessBuilder("sh", "-c",
+                "exec logcat -T " + since + " " + logcatArgs);
+            pb.redirectErrorStream(true);
+            process = pb.start();
+
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(regex);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (pattern.matcher(line).find()) {
+                    return line;
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            Log.e(TAG, "等待日志失败: " + logcatArgs, e);
+            return null;
+        } finally {
+            if (process != null) process.destroy();
+        }
+    }
+
 }
