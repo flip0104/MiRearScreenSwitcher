@@ -12,14 +12,12 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
-import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
-import android.view.Display;
 
 import rikka.shizuku.Shizuku;
 
@@ -32,11 +30,10 @@ import rikka.shizuku.Shizuku;
  *
  * 另外：
  * - 省电模式下恢复原熄屏时间，退出省电模式后再设为最大值
- * - 两块屏都亮时按电源键，系统会同时熄灭两块屏，需要重新点亮背屏。为了尽量缩短背屏熄灭的时间：
- *   1. 通过 getevent 直接监听电源键（比SCREEN_OFF广播早约0.5秒），松开后立即多次点亮背屏
- *   2. SCREEN_OFF 广播作为兜底
- *   背屏的显示状态要几秒后才变为熄灭，所以此时读到的仍是熄灭前的状态。
- *   若背屏本就亮着（例如只是主屏超时熄灭），再发wakeup不会有任何影响。
+ * - 两块屏都亮时按电源键，系统会同时熄灭两块屏，需要重新点亮背屏。
+ *   系统熄灭背屏时会打印日志 "Powering off display group due to power_button (groupId= 1, ..."，
+ *   背屏本已休眠时不会打印。通过Shizuku监听这条日志，只在背屏确实被电源键熄灭时重新点亮。
+ *   （背屏的Display状态要几秒后才更新，不能用来判断背屏之前是否亮着）
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
@@ -47,15 +44,13 @@ public class AlwaysWakeUpService extends Service {
     private static final String PREF_SAVED_TIMEOUT = "always_wakeup_saved_subscreen_timeout";
     private static final String MIUI_POWER_SAVE_CHANGED = "miui.intent.action.POWER_SAVE_MODE_CHANGED";
     private static final int REAR_DISPLAY_ID = 1;
-    // 主屏熄灭前这么久内背屏还亮着，就认为背屏是被电源键一起熄灭的
-    private static final long REAR_RECENTLY_ON_MS = 1500;
-    // 电源键松开后点亮背屏的时间点：系统熄屏可能稍晚于松开，多发几次（亮着时wakeup无影响）
-    private static final long[] POWER_KEY_REWAKE_DELAYS_MS = {30, 200, 500};
+    private static final String POWER_GROUP_LOGCAT_ARGS = "-b main -s PowerGroup:I";
+    // 背屏(display group 1)被电源键熄灭的日志
+    private static final String REAR_POWER_KEY_OFF_REGEX = "due to power_button \\(groupId= ?1,";
 
     private ITaskService taskService;
     private SharedPreferences prefs;
     private PowerManager powerManager;
-    private DisplayManager displayManager;
     private Handler mainHandler;
     private boolean bound = false;
     private volatile boolean destroyed = false;
@@ -63,16 +58,12 @@ public class AlwaysWakeUpService extends Service {
     private volatile boolean powerSaveMode = false;
     private Thread powerKeyThread;
 
-    // 背屏最近一次由亮转灭的时间
-    private int lastRearState = Display.STATE_UNKNOWN;
-    private long rearOffAtMs = 0;
-
     private final Shizuku.UserServiceArgs serviceArgs =
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
             .daemon(false)
             .processNameSuffix("always_wakeup_task_service")
             .debuggable(false)
-            .version(1);
+            .version(2); // V2: 新增 waitForLogLine
 
     private final ServiceConnection taskServiceConnection = new ServiceConnection() {
         @Override
@@ -104,46 +95,12 @@ public class AlwaysWakeUpService extends Service {
         }
     };
 
-    private final DisplayManager.DisplayListener displayListener = new DisplayManager.DisplayListener() {
-        @Override
-        public void onDisplayChanged(int displayId) {
-            if (displayId != REAR_DISPLAY_ID) return;
-            int state = getRearState();
-            if (lastRearState == Display.STATE_ON && state != Display.STATE_ON) {
-                rearOffAtMs = SystemClock.elapsedRealtime();
-            }
-            lastRearState = state;
-        }
-
-        @Override
-        public void onDisplayAdded(int displayId) {}
-
-        @Override
-        public void onDisplayRemoved(int displayId) {}
-    };
-
-    private final BroadcastReceiver screenOffReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (rearWasOn() && !powerSaveMode) {
-                Log.d(TAG, "🔌 主屏熄灭时背屏亮着，重新点亮背屏");
-                wakeRearScreen();
-            }
-        }
-    };
-
-    private boolean rearWasOn() {
-        return getRearState() == Display.STATE_ON
-            || SystemClock.elapsedRealtime() - rearOffAtMs < REAR_RECENTLY_ON_MS;
-    }
-
     /**
-     * 在后台线程用 getevent 监听电源键。每次读取2个事件（按键+SYN），按下和松开各返回一次。
+     * 后台线程循环等待"背屏被电源键熄灭"的系统日志，收到后立即重新点亮背屏
      */
     private void startPowerKeyWatcher() {
         if (powerKeyThread != null) return;
         powerKeyThread = new Thread(() -> {
-            String device = null;
             while (!destroyed) {
                 ITaskService ts = taskService;
                 if (ts == null) {
@@ -151,21 +108,14 @@ public class AlwaysWakeUpService extends Service {
                     continue;
                 }
                 try {
-                    if (device == null) {
-                        device = findPowerKeyDevice(ts);
-                        if (device == null) {
-                            Log.w(TAG, "未找到电源键输入设备，仅使用SCREEN_OFF兜底");
-                            return;
-                        }
-                        Log.d(TAG, "电源键输入设备: " + device);
+                    String line = ts.waitForLogLine(POWER_GROUP_LOGCAT_ARGS, REAR_POWER_KEY_OFF_REGEX);
+                    if (line == null) {
+                        SystemClock.sleep(1000);
+                        continue;
                     }
-                    String events = ts.executeShellCommandWithResult("getevent -lqc 2 " + device);
-                    if (events != null && events.contains("KEY_POWER") && events.contains("UP")
-                            && !destroyed && rearWasOn() && !powerSaveMode) {
-                        Log.d(TAG, "🔌 电源键松开，重新点亮背屏");
-                        for (long delay : POWER_KEY_REWAKE_DELAYS_MS) {
-                            mainHandler.postDelayed(this::wakeRearScreen, delay);
-                        }
+                    if (!destroyed && !powerSaveMode) {
+                        Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
+                        wakeRearScreen();
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "电源键监听失败: " + t.getMessage());
@@ -177,42 +127,11 @@ public class AlwaysWakeUpService extends Service {
         powerKeyThread.start();
     }
 
-    /**
-     * 从 getevent -pl 中找出带 KEY_POWER 且不是触摸屏（无ABS_MT）的输入设备
-     */
-    private static String findPowerKeyDevice(ITaskService ts) throws Exception {
-        String output = ts.executeShellCommandWithResult("getevent -pl");
-        if (output == null) return null;
-        String device = null;
-        boolean hasPowerKey = false;
-        boolean isTouch = false;
-        for (String line : output.split("\n")) {
-            if (line.startsWith("add device")) {
-                if (device != null && hasPowerKey && !isTouch) return device;
-                int idx = line.indexOf("/dev/input/");
-                device = idx >= 0 ? line.substring(idx).trim() : null;
-                hasPowerKey = false;
-                isTouch = false;
-            } else if (line.contains("KEY_POWER")) {
-                hasPowerKey = true;
-            } else if (line.contains("ABS_MT")) {
-                isTouch = true;
-            }
-        }
-        return device != null && hasPowerKey && !isTouch ? device : null;
-    }
-
-    private int getRearState() {
-        Display rear = displayManager.getDisplay(REAR_DISPLAY_ID);
-        return rear == null ? Display.STATE_UNKNOWN : rear.getState();
-    }
-
     @Override
     public void onCreate() {
         super.onCreate();
         prefs = getSharedPreferences("mrss_settings", MODE_PRIVATE);
         powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
         mainHandler = new Handler(Looper.getMainLooper());
 
         createForegroundNotification();
@@ -224,11 +143,6 @@ public class AlwaysWakeUpService extends Service {
         } else {
             registerReceiver(powerSaveReceiver, filter);
         }
-
-        registerReceiver(screenOffReceiver, new IntentFilter(Intent.ACTION_SCREEN_OFF));
-
-        lastRearState = getRearState();
-        displayManager.registerDisplayListener(displayListener, mainHandler);
 
         bindTaskService();
     }
@@ -367,14 +281,9 @@ public class AlwaysWakeUpService extends Service {
     public void onDestroy() {
         destroyed = true;
         mainHandler.removeCallbacksAndMessages(null);
-        for (BroadcastReceiver receiver : new BroadcastReceiver[] {powerSaveReceiver, screenOffReceiver}) {
-            try {
-                unregisterReceiver(receiver);
-            } catch (Exception ignored) {
-            }
-        }
-        if (displayManager != null) {
-            displayManager.unregisterDisplayListener(displayListener);
+        try {
+            unregisterReceiver(powerSaveReceiver);
+        } catch (Exception ignored) {
         }
         try {
             if (bound) {
