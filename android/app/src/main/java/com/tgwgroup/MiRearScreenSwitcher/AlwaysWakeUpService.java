@@ -36,6 +36,8 @@ import rikka.shizuku.Shizuku;
  *   （背屏的Display状态要几秒后才更新，不能用来判断背屏之前是否亮着）
  * - 背屏打开小米小部件面板（SmartAssistant）时恢复原熄屏时间，回到壁纸后再设为最大值。
  *   小米背屏Launcher会打印 "onSmartAssistantStateChanged: activated=true/false"。
+ *   只看面板出现前的背屏状态：当时亮着，面板消失后重新点亮背屏（无论期间如何熄灭）；
+ *   当时熄灭，面板消失后保持熄灭。
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
@@ -47,8 +49,8 @@ public class AlwaysWakeUpService extends Service {
     private static final String MIUI_POWER_SAVE_CHANGED = "miui.intent.action.POWER_SAVE_MODE_CHANGED";
     private static final int REAR_DISPLAY_ID = 1;
     private static final String POWER_GROUP_LOGCAT_ARGS = "-b system -s PowerGroup:I"; // system_server的日志在system缓冲区
-    // 背屏(display group 1)被电源键熄灭的日志
-    private static final String REAR_POWER_KEY_OFF_REGEX = "due to power_button \\(groupId= ?1,";
+    // 背屏(display group 1)熄灭的日志，"due to"后面是原因：power_button / timeout / application(双击) 等
+    private static final String REAR_OFF_REGEX = "Powering off display group due to \\w+ \\(groupId= ?1,";
     // 小米背屏Launcher的小部件面板开关日志（应用日志在main缓冲区）
     private static final String WIDGET_PANEL_LOGCAT_ARGS = "-b main -s SubScreenCenter_SmartAssistantManager:D";
     private static final String WIDGET_PANEL_REGEX = "onSmartAssistantStateChanged: activated=(true|false)";
@@ -65,6 +67,8 @@ public class AlwaysWakeUpService extends Service {
     private Thread widgetPanelThread;
     // 背屏是否正在显示小米小部件面板
     private volatile boolean widgetPanelOpen = false;
+    // 小部件面板出现时背屏是否亮着：决定面板消失后是否重新点亮
+    private volatile boolean rearOnWhenWidgetOpened = false;
 
     private final Shizuku.UserServiceArgs serviceArgs =
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -105,7 +109,7 @@ public class AlwaysWakeUpService extends Service {
     };
 
     /**
-     * 后台线程循环等待"背屏被电源键熄灭"的系统日志，收到后立即重新点亮背屏
+     * 后台线程循环等待"背屏熄灭"的系统日志，电源键熄灭时立即重新点亮背屏
      */
     private void startPowerKeyWatcher() {
         if (powerKeyThread != null) return;
@@ -117,15 +121,17 @@ public class AlwaysWakeUpService extends Service {
                     continue;
                 }
                 try {
-                    String line = ts.waitForLogLine(POWER_GROUP_LOGCAT_ARGS, REAR_POWER_KEY_OFF_REGEX);
+                    String line = ts.waitForLogLine(POWER_GROUP_LOGCAT_ARGS, REAR_OFF_REGEX);
                     if (line == null) {
                         SystemClock.sleep(1000);
                         continue;
                     }
-                    // 小部件面板打开时也要重新点亮：背屏原本亮着，之后按正常熄屏时间熄灭
-                    if (!destroyed && !powerSaveMode) {
-                        Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
-                        wakeRearScreen();
+                    if (line.contains("due to power_button")) {
+                        // 小部件面板打开时也要重新点亮：背屏原本亮着，之后按正常熄屏时间熄灭
+                        if (!destroyed && !powerSaveMode) {
+                            Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
+                            wakeRearScreen();
+                        }
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "电源键监听失败: " + t.getMessage());
@@ -158,8 +164,18 @@ public class AlwaysWakeUpService extends Service {
                     boolean open = line.contains("activated=true");
                     if (open != widgetPanelOpen && !destroyed) {
                         widgetPanelOpen = open;
-                        Log.d(TAG, open ? "🧩 小部件面板打开，恢复背屏熄屏时间" : "🖼 回到壁纸，背屏常亮");
+                        // 直接从系统读取背屏当前是否亮着（比跟踪日志可靠）
+                        boolean rearAwake = readRearAwake();
+                        if (open) {
+                            rearOnWhenWidgetOpened = rearAwake;
+                        }
+                        Log.d(TAG, open ? "🧩 小部件面板打开，恢复背屏熄屏时间（背屏" + (rearAwake ? "亮" : "灭") + "）"
+                                        : "🖼 回到壁纸，背屏常亮");
                         mainHandler.post(this::applyTimeout);
+                        if (!open && rearOnWhenWidgetOpened && !rearAwake && !powerSaveMode) {
+                            Log.d(TAG, "💡 小部件出现前背屏亮着，面板消失后重新点亮");
+                            mainHandler.post(this::wakeRearScreen);
+                        }
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "小部件面板监听失败: " + t.getMessage());
@@ -269,6 +285,22 @@ public class AlwaysWakeUpService extends Service {
         }
 
         if (!enabled) stopSelf();
+    }
+
+    /**
+     * 从 dumpsys power 读取背屏(power group 1)是否亮着：current wakefulness 1 = AWAKE
+     */
+    private boolean readRearAwake() {
+        try {
+            String out = taskService.executeShellCommandWithResult(
+                "dumpsys power | grep -A1 'Wakefulness Session Power Group powerGroupId: 1'");
+            if (out != null && out.contains("current wakefulness:")) {
+                return out.contains("current wakefulness: 1");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "读取背屏状态失败: " + t.getMessage());
+        }
+        return true;
     }
 
     private void wakeRearScreen() {
