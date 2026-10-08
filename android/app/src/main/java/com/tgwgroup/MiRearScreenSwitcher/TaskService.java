@@ -955,8 +955,10 @@ public class TaskService extends ITaskService.Stub {
             // 只读取调用之后产生的日志（-T 起始时间，epoch秒格式）
             long now = System.currentTimeMillis();
             String since = (now / 1000) + "." + String.format(java.util.Locale.US, "%03d", now % 1000);
+            // -e/-m 1：logcat自己过滤并在第一条匹配后退出，
+            // 即使本进程被杀、logcat成为孤儿进程，也会在下一条匹配日志时退出（regex不能含单引号）
             ProcessBuilder pb = new ProcessBuilder("sh", "-c",
-                "exec logcat -T " + since + " " + logcatArgs);
+                "exec logcat -T " + since + " " + logcatArgs + " -m 1 -e '" + regex + "'");
             pb.redirectErrorStream(true);
             process = pb.start();
 
