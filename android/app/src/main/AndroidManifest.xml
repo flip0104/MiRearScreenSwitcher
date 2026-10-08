@@ -55,6 +55,21 @@
             </intent-filter>
         </service>
         
+        <!-- Quick Settings Tile - 未投放应用时常亮（Always Wake Up） -->
+        <service
+            android:name=".AlwaysWakeUpTileService"
+            android:icon="@drawable/ic_tile_always_wakeup"
+            android:label="@string/tile_always_wakeup_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+        </service>
+
         <!-- Quick Settings Tile - 获取背屏截图 -->
         <service
             android:name=".RearScreenshotTileService"
