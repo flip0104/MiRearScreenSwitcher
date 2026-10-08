@@ -36,6 +36,7 @@ import rikka.shizuku.Shizuku;
  *   （背屏的Display状态要几秒后才更新，不能用来判断背屏之前是否亮着）
  * - 背屏打开小米小部件面板（SmartAssistant）时恢复原熄屏时间，回到壁纸后再设为最大值。
  *   小米背屏Launcher会打印 "onSmartAssistantStateChanged: activated=true/false"。
+ *   若背屏在小部件面板打开期间超时熄灭（不是用户双击/电源键熄灭），面板关闭后重新点亮背屏。
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
@@ -47,8 +48,8 @@ public class AlwaysWakeUpService extends Service {
     private static final String MIUI_POWER_SAVE_CHANGED = "miui.intent.action.POWER_SAVE_MODE_CHANGED";
     private static final int REAR_DISPLAY_ID = 1;
     private static final String POWER_GROUP_LOGCAT_ARGS = "-b system -s PowerGroup:I"; // system_server的日志在system缓冲区
-    // 背屏(display group 1)被电源键熄灭的日志
-    private static final String REAR_POWER_KEY_OFF_REGEX = "due to power_button \\(groupId= ?1,";
+    // 背屏(display group 1)熄灭的日志，"due to"后面是原因：power_button / timeout / application(双击) 等
+    private static final String REAR_OFF_REGEX = "Powering off display group due to \\w+ \\(groupId= ?1,";
     // 小米背屏Launcher的小部件面板开关日志（应用日志在main缓冲区）
     private static final String WIDGET_PANEL_LOGCAT_ARGS = "-b main -s SubScreenCenter_SmartAssistantManager:D";
     private static final String WIDGET_PANEL_REGEX = "onSmartAssistantStateChanged: activated=(true|false)";
@@ -65,6 +66,8 @@ public class AlwaysWakeUpService extends Service {
     private Thread widgetPanelThread;
     // 背屏是否正在显示小米小部件面板
     private volatile boolean widgetPanelOpen = false;
+    // 背屏是否在小部件面板打开期间超时熄灭（面板关闭后需要重新点亮）
+    private volatile boolean rearTimedOutOnWidget = false;
 
     private final Shizuku.UserServiceArgs serviceArgs =
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -105,7 +108,10 @@ public class AlwaysWakeUpService extends Service {
     };
 
     /**
-     * 后台线程循环等待"背屏被电源键熄灭"的系统日志，收到后立即重新点亮背屏
+     * 后台线程循环等待"背屏熄灭"的系统日志：
+     * - 电源键熄灭：立即重新点亮背屏
+     * - 小部件面板打开期间超时熄灭：记下来，面板关闭后重新点亮
+     * - 用户主动熄灭（双击等）：不再重新点亮
      */
     private void startPowerKeyWatcher() {
         if (powerKeyThread != null) return;
@@ -117,15 +123,19 @@ public class AlwaysWakeUpService extends Service {
                     continue;
                 }
                 try {
-                    String line = ts.waitForLogLine(POWER_GROUP_LOGCAT_ARGS, REAR_POWER_KEY_OFF_REGEX);
+                    String line = ts.waitForLogLine(POWER_GROUP_LOGCAT_ARGS, REAR_OFF_REGEX);
                     if (line == null) {
                         SystemClock.sleep(1000);
                         continue;
                     }
-                    // 小部件面板打开时也要重新点亮：背屏原本亮着，之后按正常熄屏时间熄灭
-                    if (!destroyed && !powerSaveMode) {
-                        Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
-                        wakeRearScreen();
+                    if (line.contains("due to power_button")) {
+                        // 小部件面板打开时也要重新点亮：背屏原本亮着，之后按正常熄屏时间熄灭
+                        if (!destroyed && !powerSaveMode) {
+                            Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
+                            wakeRearScreen();
+                        }
+                    } else {
+                        rearTimedOutOnWidget = widgetPanelOpen && line.contains("due to timeout");
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "电源键监听失败: " + t.getMessage());
@@ -160,6 +170,13 @@ public class AlwaysWakeUpService extends Service {
                         widgetPanelOpen = open;
                         Log.d(TAG, open ? "🧩 小部件面板打开，恢复背屏熄屏时间" : "🖼 回到壁纸，背屏常亮");
                         mainHandler.post(this::applyTimeout);
+                        if (!open && rearTimedOutOnWidget) {
+                            rearTimedOutOnWidget = false;
+                            if (!powerSaveMode) {
+                                Log.d(TAG, "💡 背屏在小部件上超时熄灭，面板关闭后重新点亮");
+                                mainHandler.post(this::wakeRearScreen);
+                            }
+                        }
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "小部件面板监听失败: " + t.getMessage());
