@@ -34,6 +34,8 @@ import rikka.shizuku.Shizuku;
  *   系统熄灭背屏时会打印日志 "Powering off display group due to power_button (groupId= 1, ..."，
  *   背屏本已休眠时不会打印。通过Shizuku监听这条日志，只在背屏确实被电源键熄灭时重新点亮。
  *   （背屏的Display状态要几秒后才更新，不能用来判断背屏之前是否亮着）
+ * - 背屏打开小米小部件面板（SmartAssistant）时恢复原熄屏时间，回到壁纸后再设为最大值。
+ *   小米背屏Launcher会打印 "onSmartAssistantStateChanged: activated=true/false"。
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
@@ -47,6 +49,9 @@ public class AlwaysWakeUpService extends Service {
     private static final String POWER_GROUP_LOGCAT_ARGS = "-b system -s PowerGroup:I"; // system_server的日志在system缓冲区
     // 背屏(display group 1)被电源键熄灭的日志
     private static final String REAR_POWER_KEY_OFF_REGEX = "due to power_button \\(groupId= ?1,";
+    // 小米背屏Launcher的小部件面板开关日志（应用日志在main缓冲区）
+    private static final String WIDGET_PANEL_LOGCAT_ARGS = "-b main -s SubScreenCenter_SmartAssistantManager:D";
+    private static final String WIDGET_PANEL_REGEX = "onSmartAssistantStateChanged: activated=(true|false)";
 
     private ITaskService taskService;
     private SharedPreferences prefs;
@@ -57,6 +62,9 @@ public class AlwaysWakeUpService extends Service {
     // 省电模式状态缓存（读取需要shell命令，熄屏路径上不能等）
     private volatile boolean powerSaveMode = false;
     private Thread powerKeyThread;
+    private Thread widgetPanelThread;
+    // 背屏是否正在显示小米小部件面板
+    private volatile boolean widgetPanelOpen = false;
 
     private final Shizuku.UserServiceArgs serviceArgs =
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -72,6 +80,7 @@ public class AlwaysWakeUpService extends Service {
             Log.d(TAG, "✓ TaskService connected");
             applyTimeout();
             startPowerKeyWatcher();
+            startWidgetPanelWatcher();
         }
 
         @Override
@@ -113,7 +122,7 @@ public class AlwaysWakeUpService extends Service {
                         SystemClock.sleep(1000);
                         continue;
                     }
-                    if (!destroyed && !powerSaveMode) {
+                    if (!destroyed && !powerSaveMode && !widgetPanelOpen) {
                         Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
                         wakeRearScreen();
                     }
@@ -125,6 +134,40 @@ public class AlwaysWakeUpService extends Service {
         }, "AlwaysWakeUpPowerKey");
         powerKeyThread.setDaemon(true);
         powerKeyThread.start();
+    }
+
+    /**
+     * 后台线程循环等待小部件面板的开关日志，打开时恢复原熄屏时间，关闭时设为最大值
+     */
+    private void startWidgetPanelWatcher() {
+        if (widgetPanelThread != null) return;
+        widgetPanelThread = new Thread(() -> {
+            while (!destroyed) {
+                ITaskService ts = taskService;
+                if (ts == null) {
+                    SystemClock.sleep(1000);
+                    continue;
+                }
+                try {
+                    String line = ts.waitForLogLine(WIDGET_PANEL_LOGCAT_ARGS, WIDGET_PANEL_REGEX);
+                    if (line == null) {
+                        SystemClock.sleep(1000);
+                        continue;
+                    }
+                    boolean open = line.contains("activated=true");
+                    if (open != widgetPanelOpen && !destroyed) {
+                        widgetPanelOpen = open;
+                        Log.d(TAG, open ? "🧩 小部件面板打开，恢复背屏熄屏时间" : "🖼 回到壁纸，背屏常亮");
+                        mainHandler.post(this::applyTimeout);
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "小部件面板监听失败: " + t.getMessage());
+                    SystemClock.sleep(1000);
+                }
+            }
+        }, "AlwaysWakeUpWidgetPanel");
+        widgetPanelThread.setDaemon(true);
+        widgetPanelThread.start();
     }
 
     @Override
@@ -199,7 +242,7 @@ public class AlwaysWakeUpService extends Service {
         if (taskService == null) return;
         boolean enabled = prefs.getBoolean("always_wakeup_enabled", false);
         powerSaveMode = readPowerSaveMode();
-        boolean keepOn = enabled && !powerSaveMode;
+        boolean keepOn = enabled && !powerSaveMode && !widgetPanelOpen;
         try {
             String current = taskService.executeShellCommandWithResult(
                 "settings get system " + TIMEOUT_SETTING);
