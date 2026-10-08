@@ -36,7 +36,8 @@ import rikka.shizuku.Shizuku;
  *   （背屏的Display状态要几秒后才更新，不能用来判断背屏之前是否亮着）
  * - 背屏打开小米小部件面板（SmartAssistant）时恢复原熄屏时间，回到壁纸后再设为最大值。
  *   小米背屏Launcher会打印 "onSmartAssistantStateChanged: activated=true/false"。
- *   若背屏在小部件面板打开期间超时熄灭（不是用户双击/电源键熄灭），面板关闭后重新点亮背屏。
+ *   小部件面板出现时背屏是亮着的，面板消失后重新点亮背屏（期间用户双击熄屏则不点亮）；
+ *   面板出现时背屏是熄灭的，面板消失后保持熄灭。
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
@@ -66,8 +67,9 @@ public class AlwaysWakeUpService extends Service {
     private Thread widgetPanelThread;
     // 背屏是否正在显示小米小部件面板
     private volatile boolean widgetPanelOpen = false;
-    // 背屏是否在小部件面板打开期间超时熄灭（面板关闭后需要重新点亮）
-    private volatile boolean rearTimedOutOnWidget = false;
+    // 小部件面板出现时背屏是否亮着、期间用户是否主动熄屏：决定面板消失后是否重新点亮
+    private volatile boolean rearOnWhenWidgetOpened = false;
+    private volatile boolean userSleptRearOnWidget = false;
 
     private final Shizuku.UserServiceArgs serviceArgs =
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -110,8 +112,7 @@ public class AlwaysWakeUpService extends Service {
     /**
      * 后台线程循环等待"背屏熄灭"的系统日志：
      * - 电源键熄灭：立即重新点亮背屏
-     * - 小部件面板打开期间超时熄灭：记下来，面板关闭后重新点亮
-     * - 用户主动熄灭（双击等）：不再重新点亮
+     * - 小部件面板打开期间用户主动熄灭（双击）：面板消失后不再点亮
      */
     private void startPowerKeyWatcher() {
         if (powerKeyThread != null) return;
@@ -134,8 +135,8 @@ public class AlwaysWakeUpService extends Service {
                             Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
                             wakeRearScreen();
                         }
-                    } else {
-                        rearTimedOutOnWidget = widgetPanelOpen && line.contains("due to timeout");
+                    } else if (widgetPanelOpen && line.contains("due to application")) {
+                        userSleptRearOnWidget = true;
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "电源键监听失败: " + t.getMessage());
@@ -168,14 +169,19 @@ public class AlwaysWakeUpService extends Service {
                     boolean open = line.contains("activated=true");
                     if (open != widgetPanelOpen && !destroyed) {
                         widgetPanelOpen = open;
-                        Log.d(TAG, open ? "🧩 小部件面板打开，恢复背屏熄屏时间" : "🖼 回到壁纸，背屏常亮");
+                        // 直接从系统读取背屏当前是否亮着（比跟踪日志可靠）
+                        boolean rearAwake = readRearAwake();
+                        if (open) {
+                            rearOnWhenWidgetOpened = rearAwake;
+                            userSleptRearOnWidget = false;
+                        }
+                        Log.d(TAG, open ? "🧩 小部件面板打开，恢复背屏熄屏时间（背屏" + (rearAwake ? "亮" : "灭") + "）"
+                                        : "🖼 回到壁纸，背屏常亮");
                         mainHandler.post(this::applyTimeout);
-                        if (!open && rearTimedOutOnWidget) {
-                            rearTimedOutOnWidget = false;
-                            if (!powerSaveMode) {
-                                Log.d(TAG, "💡 背屏在小部件上超时熄灭，面板关闭后重新点亮");
-                                mainHandler.post(this::wakeRearScreen);
-                            }
+                        if (!open && rearOnWhenWidgetOpened && !userSleptRearOnWidget
+                                && !rearAwake && !powerSaveMode) {
+                            Log.d(TAG, "💡 小部件出现前背屏亮着，面板消失后重新点亮");
+                            mainHandler.post(this::wakeRearScreen);
                         }
                     }
                 } catch (Throwable t) {
@@ -286,6 +292,22 @@ public class AlwaysWakeUpService extends Service {
         }
 
         if (!enabled) stopSelf();
+    }
+
+    /**
+     * 从 dumpsys power 读取背屏(power group 1)是否亮着：current wakefulness 1 = AWAKE
+     */
+    private boolean readRearAwake() {
+        try {
+            String out = taskService.executeShellCommandWithResult(
+                "dumpsys power | grep -A1 'Wakefulness Session Power Group powerGroupId: 1'");
+            if (out != null && out.contains("current wakefulness:")) {
+                return out.contains("current wakefulness: 1");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "读取背屏状态失败: " + t.getMessage());
+        }
+        return true;
     }
 
     private void wakeRearScreen() {
