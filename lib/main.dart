@@ -102,7 +102,7 @@ class HomePage extends StatefulWidget {
 
 enum ShizukuStatus { checking, running, error }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const platform = MethodChannel('com.display.switcher/task');
 
   // Status Enum
@@ -144,6 +144,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _checkShizuku();
     _loadSettings(); // 加载所有设置
     _setupMethodCallHandler();
@@ -160,9 +161,32 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _dpiController.dispose();
     _dpiFocusNode.dispose();
     super.dispose();
+  }
+
+  // 快捷设置磁贴可能在应用外修改了开关，回到应用时重新读取
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _reloadWakeSettings();
+    }
+  }
+
+  Future<void> _reloadWakeSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload(); // 读取原生代码写入的最新值
+      if (!mounted) return;
+      setState(() {
+        _keepScreenOnEnabled = prefs.getBool('keep_screen_on_enabled') ?? true;
+        _alwaysWakeUpEnabled = prefs.getBool('always_wakeup_enabled') ?? false;
+      });
+    } catch (e) {
+      print('重新加载常亮设置失败: $e');
+    }
   }
 
   void _setupMethodCallHandler() {

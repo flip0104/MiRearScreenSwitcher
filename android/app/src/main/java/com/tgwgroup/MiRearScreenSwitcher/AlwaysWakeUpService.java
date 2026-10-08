@@ -12,6 +12,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -38,6 +42,8 @@ import rikka.shizuku.Shizuku;
  *   小米背屏Launcher会打印 "onSmartAssistantStateChanged: activated=true/false"。
  *   只看面板出现前的背屏状态：当时亮着，面板消失后重新点亮背屏（无论期间如何熄灭）；
  *   当时熄灭，面板消失后保持熄灭。
+ * - 背屏被遮挡（背屏接近传感器）超过1.5秒时关闭背屏显示，移开后恢复（受"接近传感器"开关控制）。
+ *   用 cmd display power-off/power-reset 只关闭背屏面板，不让背屏进入休眠，不影响上面的逻辑。
  */
 public class AlwaysWakeUpService extends Service {
     private static final String TAG = "AlwaysWakeUpService";
@@ -55,6 +61,9 @@ public class AlwaysWakeUpService extends Service {
     private static final String WIDGET_PANEL_LOGCAT_ARGS = "-b main -s SubScreenCenter_SmartAssistantManager:D";
     private static final String WIDGET_PANEL_REGEX = "onSmartAssistantStateChanged: activated=(true|false)";
 
+    // 背屏被遮挡多久后关闭背屏显示
+    private static final long COVER_OFF_DELAY_MS = 1500; // 与RearScreenKeeperService的防抖一致
+
     private ITaskService taskService;
     private SharedPreferences prefs;
     private PowerManager powerManager;
@@ -69,6 +78,43 @@ public class AlwaysWakeUpService extends Service {
     private volatile boolean widgetPanelOpen = false;
     // 小部件面板出现时背屏是否亮着：决定面板消失后是否重新点亮
     private volatile boolean rearOnWhenWidgetOpened = false;
+
+    // 背屏遮挡检测
+    private SensorManager sensorManager;
+    private Sensor rearProximitySensor;
+    private boolean rearCovered = false;
+    private boolean rearPoweredOffByCover = false;
+
+    private final Runnable coverOffRunnable = () -> {
+        if (!rearCovered || destroyed || taskService == null || !proximityEnabled()) return;
+        if (!readRearAwake()) return; // 背屏本就熄灭，无需处理
+        try {
+            taskService.executeShellCommand("cmd display power-off " + REAR_DISPLAY_ID);
+            rearPoweredOffByCover = true;
+            Log.d(TAG, "🙈 背屏被遮挡，关闭背屏显示");
+        } catch (Throwable t) {
+            Log.w(TAG, "关闭背屏显示失败: " + t.getMessage());
+        }
+    };
+
+    private final SensorEventListener coverListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            // 与RearScreenKeeperService一致：小于最大距离的20%视为遮挡
+            boolean covered = event.values[0] < rearProximitySensor.getMaximumRange() * 0.2f;
+            if (covered == rearCovered) return;
+            rearCovered = covered;
+            if (covered) {
+                mainHandler.postDelayed(coverOffRunnable, COVER_OFF_DELAY_MS);
+            } else {
+                mainHandler.removeCallbacks(coverOffRunnable);
+                restoreRearAfterCover();
+            }
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+    };
 
     private final Shizuku.UserServiceArgs serviceArgs =
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -204,7 +250,55 @@ public class AlwaysWakeUpService extends Service {
             registerReceiver(powerSaveReceiver, filter);
         }
 
+        registerCoverSensor();
         bindTaskService();
+    }
+
+    /**
+     * 注册背屏接近传感器（名称包含 "Proximity" 和 "Back"，优先非唤醒型），与RearScreenKeeperService相同
+     */
+    private void registerCoverSensor() {
+        sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+        if (sensorManager == null) return;
+        Sensor wakeup = null;
+        for (Sensor sensor : sensorManager.getSensorList(Sensor.TYPE_ALL)) {
+            String name = sensor.getName();
+            if (name.contains("Proximity") && name.contains("Back") && !name.contains("Strm")) {
+                if (!sensor.isWakeUpSensor()) {
+                    rearProximitySensor = sensor;
+                    break;
+                }
+                if (wakeup == null) wakeup = sensor;
+            }
+        }
+        if (rearProximitySensor == null) rearProximitySensor = wakeup;
+        if (rearProximitySensor == null) {
+            Log.w(TAG, "未找到背屏接近传感器，遮挡熄屏不可用");
+            return;
+        }
+        sensorManager.registerListener(coverListener, rearProximitySensor,
+            SensorManager.SENSOR_DELAY_NORMAL, mainHandler);
+    }
+
+    private boolean proximityEnabled() {
+        return getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+            .getBoolean("flutter.proximity_sensor_enabled", true);
+    }
+
+    /**
+     * 恢复被遮挡关闭的背屏显示（power-reset 让背屏回到系统认为应有的状态，背屏已休眠时不会点亮）
+     */
+    private void restoreRearAfterCover() {
+        if (!rearPoweredOffByCover) return;
+        rearPoweredOffByCover = false;
+        try {
+            if (taskService != null) {
+                taskService.executeShellCommand("cmd display power-reset " + REAR_DISPLAY_ID);
+                Log.d(TAG, "👀 背屏不再被遮挡，恢复背屏显示");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "恢复背屏显示失败: " + t.getMessage());
+        }
     }
 
     @Override
@@ -357,6 +451,10 @@ public class AlwaysWakeUpService extends Service {
     public void onDestroy() {
         destroyed = true;
         mainHandler.removeCallbacksAndMessages(null);
+        if (sensorManager != null) {
+            sensorManager.unregisterListener(coverListener);
+        }
+        restoreRearAfterCover();
         try {
             unregisterReceiver(powerSaveReceiver);
         } catch (Exception ignored) {
