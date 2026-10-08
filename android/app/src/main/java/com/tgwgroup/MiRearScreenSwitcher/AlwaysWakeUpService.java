@@ -122,7 +122,8 @@ public class AlwaysWakeUpService extends Service {
                         SystemClock.sleep(1000);
                         continue;
                     }
-                    if (!destroyed && !powerSaveMode && !widgetPanelOpen) {
+                    // 小部件面板打开时也要重新点亮：背屏原本亮着，之后按正常熄屏时间熄灭
+                    if (!destroyed && !powerSaveMode) {
                         Log.d(TAG, "🔌 电源键熄灭了背屏，重新点亮");
                         wakeRearScreen();
                     }
