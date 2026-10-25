@@ -121,7 +121,7 @@ public class AlwaysWakeUpService extends Service {
             .daemon(false)
             .processNameSuffix("always_wakeup_task_service")
             .debuggable(false)
-            .version(2); // V2: 新增 waitForLogLine
+            .version(1); // 必须与其他Service一致：Shizuku按类名共用同一个TaskService，版本不同会互相杀掉重启
 
     private final ServiceConnection taskServiceConnection = new ServiceConnection() {
         @Override
